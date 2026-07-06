@@ -3,6 +3,8 @@
  * 处理 Anthropic / OpenAI 两种格式的请求转发，支持流式与非流式
  */
 
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 const config = require("./config");
 const { injectThinkingPrompt, extractDepthFromBody, resolveDepth } = require("./thinking");
 const { enrichAnthropicResponse, parseResponse } = require("./parser");
@@ -120,7 +122,7 @@ async function proxyAnthropicNonStream(finalBody, modelCfg, reqHeaders) {
 }
 
 /**
- * 处理 Anthropic 格式的流式请求 — 直接管道透传上游 SSE
+ * 处理 Anthropic 格式的流式请求 — 管道透传上游 SSE
  * 仅用于 native / none 模式（prompt 模式已在 prepareUpstreamBody 中关闭 stream）
  */
 async function proxyAnthropicStream(finalBody, reqHeaders, res) {
@@ -150,21 +152,12 @@ async function proxyAnthropicStream(finalBody, reqHeaders, res) {
     "X-Accel-Buffering": "no",
   });
 
-  // 管道上游 SSE 流到客户端
-  const reader = upstreamResp.body.getReader();
-  const decoder = new TextDecoder();
-
+  // 使用 Node.js pipeline 管道直传（比手动 read/write 稳定）
+  const nodeStream = Readable.fromWeb(upstreamResp.body);
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(value);
-    }
+    await pipeline(nodeStream, res);
   } catch (err) {
     console.error("[proxy] 流传输中断:", err.message);
-  } finally {
-    reader.releaseLock();
-    res.end();
   }
 }
 
@@ -208,7 +201,7 @@ async function proxyOpenAINonStream(finalBody, modelCfg, reqHeaders) {
 }
 
 /**
- * 处理 OpenAI 格式的流式请求 — 直接管道透传上游 SSE
+ * 处理 OpenAI 格式的流式请求 — 管道透传上游 SSE
  */
 async function proxyOpenAIStream(finalBody, reqHeaders, res) {
   const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/chat/completions`;
@@ -236,18 +229,11 @@ async function proxyOpenAIStream(finalBody, reqHeaders, res) {
     "X-Accel-Buffering": "no",
   });
 
-  const reader = upstreamResp.body.getReader();
+  const nodeStream = Readable.fromWeb(upstreamResp.body);
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(value);
-    }
+    await pipeline(nodeStream, res);
   } catch (err) {
-    console.error("[proxy] 流传输中断:", err.message);
-  } finally {
-    reader.releaseLock();
-    res.end();
+    console.error("[proxy] OpenAI 流传输中断:", err.message);
   }
 }
 
