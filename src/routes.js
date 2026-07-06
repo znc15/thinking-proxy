@@ -1,6 +1,5 @@
 /**
  * 路由模块
- * 定义所有 API 端点，支持流式与非流式
  */
 
 const express = require("express");
@@ -10,14 +9,12 @@ const { parseResponse, hideThinking } = require("./parser");
 
 const router = express.Router();
 
-// ========== 模型列表 ==========
+// ── 模型列表 ────────────────────────────────────────────
 
 router.get("/v1/models", async (req, res) => {
   try {
     const response = await fetch(`${config.UPSTREAM_BASE_URL}/v1/models`, {
-      headers: {
-        Authorization: `Bearer ${config.UPSTREAM_API_KEY}`,
-      },
+      headers: { Authorization: `Bearer ${config.UPSTREAM_API_KEY}` },
     });
     const data = await response.json();
     if (data.data) {
@@ -40,15 +37,14 @@ router.get("/models", (req, res) => {
   });
 });
 
-// ========== Anthropic 格式 ==========
+// ── 核心代理 ────────────────────────────────────────────
 
+// POST /v1/messages      — Anthropic（流式 + 非流式）
 router.post("/v1/messages", async (req, res) => {
   try {
     const result = await proxyAnthropic(req.body, req.headers, res);
-    // 仅非流式才会返回 result 对象；流式时 res 已被接管
-    if (result) {
-      res.status(result.status).json(result.body);
-    }
+    if (result) res.json(result);             // 非流式：返回 JSON
+    // 流式：res 已被 proxyStream 接管，无需额外处理
   } catch (err) {
     if (!res.headersSent) {
       console.error("[error] /v1/messages:", err.message);
@@ -57,14 +53,11 @@ router.post("/v1/messages", async (req, res) => {
   }
 });
 
-// ========== OpenAI 格式 ==========
-
+// POST /v1/chat/completions — OpenAI（流式 + 非流式）
 router.post("/v1/chat/completions", async (req, res) => {
   try {
     const result = await proxyOpenAI(req.body, req.headers, res);
-    if (result) {
-      res.status(result.status).json(result.body);
-    }
+    if (result) res.json(result);
   } catch (err) {
     if (!res.headersSent) {
       console.error("[error] /v1/chat/completions:", err.message);
@@ -73,25 +66,21 @@ router.post("/v1/chat/completions", async (req, res) => {
   }
 });
 
-// ========== 工具端点 ==========
+// ── 工具 ────────────────────────────────────────────────
 
 router.post("/parse", (req, res) => {
   const { text } = req.body;
-  if (!text) {
-    return res.status(400).json({ error: "缺少 text 字段" });
-  }
+  if (!text) return res.status(400).json({ error: "缺少 text 字段" });
   res.json(parseResponse(text));
 });
 
 router.post("/hide-thinking", (req, res) => {
   const { text } = req.body;
-  if (!text) {
-    return res.status(400).json({ error: "缺少 text 字段" });
-  }
+  if (!text) return res.status(400).json({ error: "缺少 text 字段" });
   res.json({ answer: hideThinking(text) });
 });
 
-// ========== 健康检查 ==========
+// ── 健康检查 ────────────────────────────────────────────
 
 router.get("/health", (req, res) => {
   res.json({

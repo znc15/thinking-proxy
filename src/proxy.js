@@ -1,6 +1,13 @@
 /**
  * 代理转发核心模块
- * 处理 Anthropic / OpenAI 两种格式的请求转发，支持流式与非流式
+ *
+ * 三种 thinking 模式：
+ * - native: 保留 thinking 参数透传
+ * - prompt: 移除 thinking 参数，注入提示词 → 流式/非流式都通用
+ * - none:   移除 thinking 参数，原始透传
+ *
+ * 流式：pipeline 管道直传上游 SSE
+ * 非流式：fetch await response.json() → prompt 模式下解析 thinking 标签
  */
 
 const { Readable } = require("stream");
@@ -9,142 +16,79 @@ const config = require("./config");
 const { injectThinkingPrompt, extractDepthFromBody, resolveDepth } = require("./thinking");
 const { enrichAnthropicResponse, parseResponse } = require("./parser");
 
-/**
- * 构建上游请求头
- * @param {object} reqHeaders - 客户端请求头
- * @returns {object} 转发给上游的头
- */
+// ── 工具 ──────────────────────────────────────────────
+
 function buildUpstreamHeaders(reqHeaders) {
   const upstream = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${config.UPSTREAM_API_KEY}`,
   };
-
-  const passthrough = [
-    "anthropic-version",
-    "anthropic-beta",
-    "x-api-key",
-    "accept",
-  ];
-  for (const key of passthrough) {
-    const lk = key.toLowerCase();
-    const val = reqHeaders[key] || reqHeaders[lk];
-    if (val && key !== "x-api-key") {
-      upstream[key] = val;
-    }
+  for (const key of ["anthropic-version", "anthropic-beta", "accept"]) {
+    const val = reqHeaders[key] || reqHeaders[key.toLowerCase()];
+    if (val) upstream[key] = val;
   }
-
   return upstream;
 }
 
-/**
- * 检测请求是否启用流式
- */
 function isStreamRequest(body) {
   return body && body.stream === true;
 }
 
-/**
- * 准备发给上游的请求体（注入 thinking 提示词等）
- */
-function prepareUpstreamBody(requestBody, reqHeaders, format) {
+// ── 核心：准备上游请求体 ──────────────────────────────
+
+function prepareUpstreamBody(requestBody, format) {
   const body = JSON.parse(JSON.stringify(requestBody));
   const model = body.model || "claude-sonnet-4-6";
   const modelCfg = config.getModelConfig(model);
 
-  const rawThinking = body.thinking;
-  const effort = (rawThinking && rawThinking.effort) || null;
+  const effort = (body.thinking && body.thinking.effort) || null;
   const { depth, body: cleanedBody } = extractDepthFromBody(body, format);
   const finalDepth = depth || config.DEFAULT_THINKING_DEPTH;
 
+  const stream = isStreamRequest(body);
   console.log(
-    `[proxy] ${format === "anthropic" ? "Anthropic" : "OpenAI"} | model=${model} | thinking=${modelCfg.thinking} | effort=${effort || "无"} | depth=${finalDepth} | stream=${!!isStreamRequest(body)}`
+    `[proxy] ${format === "anthropic" ? "Anthropic" : "OpenAI"} | model=${model} | ` +
+    `mode=${modelCfg.thinking} | effort=${effort || "-"} | depth=${finalDepth} | stream=${stream}`
   );
 
   let finalBody = cleanedBody;
 
   switch (modelCfg.thinking) {
     case config.THINKING_TYPES.NATIVE:
-      if (effort) {
-        console.log(`[proxy] 原生 thinking + effort=${effort}，透传`);
-      } else {
-        console.log(`[proxy] 原生 thinking 模式，透传`);
-      }
+      console.log(`  → 原生 thinking，透传`);
       break;
 
     case config.THINKING_TYPES.PROMPT: {
-      const mappedDepth = effort ? resolveDepth(effort) : finalDepth;
-      console.log(`[proxy] 提示词模拟模式, thinking.effort=${effort || "无"} → depth=${mappedDepth}`);
+      const mapped = effort ? resolveDepth(effort) : finalDepth;
       delete finalBody.thinking;
-      finalBody = injectThinkingPrompt(finalBody, mappedDepth, format);
-
-      // 提示词模式不支持流式（需要完整回复才能解析 thinking 标签）
-      if (finalBody.stream) {
-        console.log(`[proxy] 提示词模式下强制关闭 stream（需要完整回复解析 thinking 块）`);
-        finalBody.stream = false;
-      }
+      finalBody = injectThinkingPrompt(finalBody, mapped, format);
+      console.log(`  → 提示词模拟 (depth=${mapped}), stream=${stream}（流式正常透传）`);
       break;
     }
 
     case config.THINKING_TYPES.NONE:
       delete finalBody.thinking;
-      console.log(`[proxy] 无 thinking 模式，直接透传`);
+      console.log(`  → 透传模式`);
       break;
   }
 
-  return { body: finalBody, modelCfg };
+  return { body: finalBody, model, modelCfg };
 }
 
-/**
- * 处理 Anthropic 格式的非流式请求
- */
-async function proxyAnthropicNonStream(finalBody, modelCfg, reqHeaders) {
-  const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/messages`;
-  const upstreamHeaders = buildUpstreamHeaders(reqHeaders);
+// ── 统一管道：流式透传 SSE ─────────────────────────────
 
-  const response = await fetch(upstreamUrl, {
-    method: "POST",
-    headers: upstreamHeaders,
-    body: JSON.stringify(finalBody),
-  });
-
-  const responseBody = await response.json();
-
-  if (!response.ok) {
-    return { status: response.status, body: responseBody };
-  }
-
-  if (config.PARSE_THINKING_RESPONSE && modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
-    return { status: response.status, body: enrichAnthropicResponse(responseBody) };
-  }
-
-  return { status: response.status, body: responseBody };
-}
-
-/**
- * 处理 Anthropic 格式的流式请求 — 管道透传上游 SSE
- * 仅用于 native / none 模式（prompt 模式已在 prepareUpstreamBody 中关闭 stream）
- */
-async function proxyAnthropicStream(finalBody, reqHeaders, res) {
-  const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/messages`;
-  const upstreamHeaders = buildUpstreamHeaders(reqHeaders);
-
+async function proxyStream(upstreamUrl, finalBody, reqHeaders, res) {
   const upstreamResp = await fetch(upstreamUrl, {
     method: "POST",
-    headers: upstreamHeaders,
+    headers: buildUpstreamHeaders(reqHeaders),
     body: JSON.stringify(finalBody),
   });
 
   if (!upstreamResp.ok) {
     const errText = await upstreamResp.text();
-    try {
-      return { status: upstreamResp.status, body: JSON.parse(errText) };
-    } catch {
-      return { status: upstreamResp.status, body: { error: errText } };
-    }
+    try { return JSON.parse(errText); } catch { return { error: errText }; }
   }
 
-  // 设置 SSE 响应头
   res.writeHead(upstreamResp.status, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -152,126 +96,77 @@ async function proxyAnthropicStream(finalBody, reqHeaders, res) {
     "X-Accel-Buffering": "no",
   });
 
-  // 使用 Node.js pipeline 管道直传（比手动 read/write 稳定）
   const nodeStream = Readable.fromWeb(upstreamResp.body);
   try {
     await pipeline(nodeStream, res);
   } catch (err) {
-    console.error("[proxy] 流传输中断:", err.message);
+    if (err.code !== "ERR_STREAM_PREMATURE_CLOSE") {
+      console.error("[proxy] 流中断:", err.message);
+    }
   }
 }
 
-/**
- * 处理 Anthropic 格式请求 (/v1/messages)
- */
+// ── 非流式 ─────────────────────────────────────────────
+
+async function proxyNonStream(upstreamUrl, finalBody, modelCfg, reqHeaders) {
+  const response = await fetch(upstreamUrl, {
+    method: "POST",
+    headers: buildUpstreamHeaders(reqHeaders),
+    body: JSON.stringify(finalBody),
+  });
+  const responseBody = await response.json();
+  if (!response.ok) return responseBody;
+
+  // prompt 模式非流式：解析 thinking/answer 标签为独立 block
+  if (config.PARSE_THINKING_RESPONSE && modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
+    return enrichAnthropicResponse(responseBody);
+  }
+  return responseBody;
+}
+
+// ── 对外入口 ───────────────────────────────────────────
+
 async function proxyAnthropic(requestBody, reqHeaders, res) {
-  const { body: finalBody, modelCfg } = prepareUpstreamBody(requestBody, reqHeaders, "anthropic");
+  const { body: finalBody, modelCfg } = prepareUpstreamBody(requestBody, "anthropic");
+  const url = `${config.UPSTREAM_BASE_URL}/v1/messages`;
 
   if (isStreamRequest(finalBody)) {
-    return proxyAnthropicStream(finalBody, reqHeaders, res);
+    await proxyStream(url, finalBody, reqHeaders, res);
+    return null; // res 已被接管
   }
-  return proxyAnthropicNonStream(finalBody, modelCfg, reqHeaders);
+  return proxyNonStream(url, finalBody, modelCfg, reqHeaders);
 }
 
-/**
- * 处理 OpenAI 格式的非流式请求
- */
-async function proxyOpenAINonStream(finalBody, modelCfg, reqHeaders) {
-  const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/chat/completions`;
-  const upstreamHeaders = buildUpstreamHeaders(reqHeaders);
-
-  const response = await fetch(upstreamUrl, {
-    method: "POST",
-    headers: upstreamHeaders,
-    body: JSON.stringify(finalBody),
-  });
-
-  const responseBody = await response.json();
-
-  if (!response.ok) {
-    return { status: response.status, body: responseBody };
-  }
-
-  if (config.PARSE_THINKING_RESPONSE && modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
-    const enriched = enrichOpenAIResponse(responseBody);
-    return { status: response.status, body: enriched };
-  }
-
-  return { status: response.status, body: responseBody };
-}
-
-/**
- * 处理 OpenAI 格式的流式请求 — 管道透传上游 SSE
- */
-async function proxyOpenAIStream(finalBody, reqHeaders, res) {
-  const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/chat/completions`;
-  const upstreamHeaders = buildUpstreamHeaders(reqHeaders);
-
-  const upstreamResp = await fetch(upstreamUrl, {
-    method: "POST",
-    headers: upstreamHeaders,
-    body: JSON.stringify(finalBody),
-  });
-
-  if (!upstreamResp.ok) {
-    const errText = await upstreamResp.text();
-    try {
-      return { status: upstreamResp.status, body: JSON.parse(errText) };
-    } catch {
-      return { status: upstreamResp.status, body: { error: errText } };
-    }
-  }
-
-  res.writeHead(upstreamResp.status, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-
-  const nodeStream = Readable.fromWeb(upstreamResp.body);
-  try {
-    await pipeline(nodeStream, res);
-  } catch (err) {
-    console.error("[proxy] OpenAI 流传输中断:", err.message);
-  }
-}
-
-/**
- * 处理 OpenAI 格式请求 (/v1/chat/completions)
- */
 async function proxyOpenAI(requestBody, reqHeaders, res) {
-  const { body: finalBody, modelCfg } = prepareUpstreamBody(requestBody, reqHeaders, "openai");
+  const { body: finalBody, modelCfg } = prepareUpstreamBody(requestBody, "openai");
+  const url = `${config.UPSTREAM_BASE_URL}/v1/chat/completions`;
 
   if (isStreamRequest(finalBody)) {
-    return proxyOpenAIStream(finalBody, reqHeaders, res);
+    await proxyStream(url, finalBody, reqHeaders, res);
+    return null;
   }
-  return proxyOpenAINonStream(finalBody, modelCfg, reqHeaders);
+
+  const responseBody = await proxyNonStream(url, finalBody, modelCfg, reqHeaders);
+  // prompt 模式非流式：OpenAI 格式额外解析
+  if (config.PARSE_THINKING_RESPONSE && modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
+    return enrichOpenAIResponse(responseBody);
+  }
+  return responseBody;
 }
 
-function enrichOpenAIResponse(responseBody) {
-  if (!responseBody || !responseBody.choices) return responseBody;
+// ── OpenAI 格式回复增强 ────────────────────────────────
 
-  const choices = responseBody.choices.map((choice) => {
-    const content = choice.message?.content || "";
-    if (!content) return choice;
-
-    const parsed = parseResponse(content);
-    return {
-      ...choice,
-      message: {
-        ...choice.message,
-        content: parsed.answer,
-        thinking_content: parsed.thinking || undefined,
-      },
-    };
-  });
-
-  return { ...responseBody, choices };
+function enrichOpenAIResponse(body) {
+  if (!body || !body.choices) return body;
+  return {
+    ...body,
+    choices: body.choices.map((c) => {
+      const text = c.message?.content || "";
+      if (!text) return c;
+      const p = parseResponse(text);
+      return { ...c, message: { ...c.message, content: p.answer, thinking_content: p.thinking || undefined } };
+    }),
+  };
 }
 
-module.exports = {
-  proxyAnthropic,
-  proxyOpenAI,
-  buildUpstreamHeaders,
-};
+module.exports = { proxyAnthropic, proxyOpenAI };
