@@ -5,73 +5,72 @@
 
 const THINKING_SYSTEM_PROMPTS = {
   quick: [
-    "【系统级强制规则】每次回复必须包含 <thinking>...</thinking> 和 <answer>...</answer>。",
-    "thinking 中写1-3句简要推理。即使简单问题也不可省略标签。",
+    "【系统级规则】",
+    "你的回复将以纯文本被程序解析。程序只识别 <thinking> 和 <answer> 标签。",
+    "",
+    "格式（必须严格遵守）：",
+    "<thinking>1-3句简明推理</thinking>",
+    "<answer>最终回答</answer>",
+    "",
+    "禁止事项：",
+    "- 禁止在标签外输出任何文字",
+    "- 禁止在回复中使用 emoji 表情符号",
+    "- 禁止省略 <thinking> 或 <answer> 标签",
   ].join("\n"),
 
   standard: [
-    "===== 输出格式协议 v2.0 =====",
-    "你每次回复的输出都将被程序自动解析。",
-    "程序仅识别 <thinking> 和 <answer> 标签内的内容。",
-    "不包含这两个标签的回复将被视为格式错误并丢弃。",
+    "===== 协议 v3 =====",
+    "系统将你的输出解析为结构化数据。你必须严格按照以下格式回复，无一例外。",
     "",
-    "你的回复必须以 <thinking> 开头，这是绝对要求。",
-    "",
-    "正确格式（唯一接受的格式）：",
+    "【输出格式】",
     "<thinking>",
-    "逐步推理过程（问题理解→关键信息→方案分析→推导→验证）",
-    "</thinking>",
-    "",
-    "<answer>",
-    "最终答案",
-    "</answer>",
-    "",
-    "规则（违规=格式错误）：",
-    "1. 回复必须以 <thinking> 标签开头",
-    "2. <thinking> 后必须跟 </thinking>，然后是 <answer> 和 </answer>",
-    "3. 任何其他格式（如直接给答案、不带标签、标签变形）均不可接受",
-    "4. 即使是最简单的问候也必须包含两对标签",
-    "",
-    "示例 — 用户问 1+1=？：",
-    "<thinking>",
-    "这是基础整数加法。1 个单位加 1 个单位得到 2。",
+    "推理过程（问题理解→关键信息→方案分析→推导→验证）",
     "</thinking>",
     "<answer>",
-    "1 + 1 = 2",
+    "最终答案（纯文本，不使用任何 emoji 表情符号）",
     "</answer>",
     "",
-    "现在开始。你的第一条回复必须以 <thinking> 开头。",
+    "【绝对禁止】",
+    "1. 禁止在 <thinking> 或 <answer> 标签之外输出任何文字",
+    "2. 禁止在回复的任何位置使用 emoji（如 😊👍✅❌🎉💡 等）",
+    "3. 禁止省略任何一个标签",
+    "4. 禁止用「好的」、「明白了」等寒暄开头——直接输出 <thinking>",
+    "",
+    "【示例】",
+    "用户：1+1=?",
+    "<thinking>",
+    "整数加法，1个单位加1个单位等于2。",
+    "</thinking>",
+    "<answer>",
+    "1+1=2",
+    "</answer>",
+    "",
+    "现在开始。记住：不寒暄、不用表情、直接输出标签。",
   ].join("\n"),
 
   deep: [
-    "【系统级强制规则 - 绝对不可违反】",
+    "===== 协议 v3（深度推理） =====",
+    "系统将你的输出解析为结构化数据。你必须严格按照以下格式回复。",
     "",
-    "你每一次回复都必须严格按以下格式输出：",
+    "【输出格式】",
     "<thinking>",
     "### 1. 问题理解",
-    "- [用自己的话复述问题，确认理解正确]",
-    "",
+    "- 用自己的话复述，确认理解正确",
     "### 2. 关键信息",
-    "- 已知条件 / 约束 / 目标",
-    "",
-    "### 3. 方案分析（至少2个备选）",
-    "- 方案A：[描述] — 优点/缺点/复杂度/风险",
-    "- 方案B：[描述] — 优点/缺点/复杂度/风险",
-    "",
+    "- 已知条件、约束、目标",
+    "### 3. 方案分析（至少2个备选，对比优劣）",
     "### 4. 方案选择与推导",
-    "- 选择方案X，理由：[说明]",
-    "- 逐步推导过程",
-    "",
     "### 5. 验证与边界检查",
-    "- [ ] 满足所有需求？",
-    "- [ ] 边界条件 OK？",
     "</thinking>",
-    "",
     "<answer>",
-    "[最终答案]",
+    "最终答案（纯文本，不使用任何 emoji 表情符号）",
     "</answer>",
     "",
-    "不可省略任何标签或子步骤。",
+    "【绝对禁止】",
+    "1. 标签之外不能有任何文字",
+    "2. 整个回复不能出现任何 emoji",
+    "3. 禁止寒暄——直接输出 <thinking> 开头的内容",
+    "4. 标签不能变形或省略",
   ].join("\n"),
 };
 
@@ -107,20 +106,15 @@ function injectThinkingPrompt(body, depth = "standard", format = "anthropic") {
       cloned.system = cloned.system + "\n\n" + thinkingPrompt;
     }
 
-    // 双保险：在最后一条用户消息末尾追加格式提醒
+    // 双保险：用户消息末尾追加简短格式提醒
     const msgs = cloned.messages || [];
     if (msgs.length > 0) {
       const lastMsg = msgs[msgs.length - 1];
+      const hint = "\n\n（直接回复 <thinking>...</thinking><answer>...</answer>，不寒暄不用表情）";
       if (lastMsg.role === "user" && typeof lastMsg.content === "string") {
-        lastMsg.content =
-          lastMsg.content +
-          "\n\n（请严格按格式回复：先输出 <thinking>...</thinking> 标签包裹的推理过程，再输出 <answer>...</answer> 标签包裹的最终答案。不可省略标签。）";
+        lastMsg.content = lastMsg.content + hint;
       } else if (lastMsg.role === "user" && Array.isArray(lastMsg.content)) {
-        // content 是数组格式，追加 text block
-        lastMsg.content.push({
-          type: "text",
-          text: "\n\n（请严格按格式回复：先输出 <thinking>...</thinking> 标签包裹的推理过程，再输出 <answer>...</answer> 标签包裹的最终答案。不可省略标签。）",
-        });
+        lastMsg.content.push({ type: "text", text: hint });
       }
     }
   } else {
@@ -140,7 +134,7 @@ function injectThinkingPrompt(body, depth = "standard", format = "anthropic") {
       if (lastUserIdx >= 0) {
         messages[lastUserIdx].content =
           messages[lastUserIdx].content +
-          "\n\n（请严格按格式回复：先输出 <thinking> 标签的推理，再输出 <answer> 标签的答案。）";
+          "\n\n（直接回复 <thinking>...</thinking><answer>...</answer>，不寒暄不用表情）";
       }
     }
     cloned.messages = messages;
