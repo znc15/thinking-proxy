@@ -6,7 +6,7 @@
 const THINKING_SYSTEM_PROMPTS = {
   quick: [
     "【系统级规则】",
-    "你的回复将以纯文本被程序解析。程序只识别 <thinking> 和 <answer> 标签。",
+    "你的回复将被程序自动解析。程序仅识别 <thinking> 和 <answer> 标签内的内容。",
     "",
     "格式（必须严格遵守）：",
     "<thinking>1-3句简明推理</thinking>",
@@ -14,27 +14,25 @@ const THINKING_SYSTEM_PROMPTS = {
     "",
     "禁止事项：",
     "- 禁止在标签外输出任何文字",
-    "- 禁止在回复中使用 emoji 表情符号",
-    "- 禁止省略 <thinking> 或 <answer> 标签",
+    "- 禁止用「好的」「明白了」等寒暄开头——直接输出 <thinking>",
   ].join("\n"),
 
   standard: [
     "===== 协议 v3 =====",
-    "系统将你的输出解析为结构化数据。你必须严格按照以下格式回复，无一例外。",
+    "系统将你的输出解析为结构化数据。你必须严格按照以下格式回复。",
     "",
     "【输出格式】",
     "<thinking>",
     "推理过程（问题理解→关键信息→方案分析→推导→验证）",
     "</thinking>",
     "<answer>",
-    "最终答案（纯文本，不使用任何 emoji 表情符号）",
+    "最终答案",
     "</answer>",
     "",
     "【绝对禁止】",
     "1. 禁止在 <thinking> 或 <answer> 标签之外输出任何文字",
-    "2. 禁止在回复的任何位置使用 emoji（如 😊👍✅❌🎉💡 等）",
+    "2. 禁止用「好的」「明白了」「你好」等寒暄开头——回复的第一个字符必须是 <",
     "3. 禁止省略任何一个标签",
-    "4. 禁止用「好的」、「明白了」等寒暄开头——直接输出 <thinking>",
     "",
     "【示例】",
     "用户：1+1=?",
@@ -45,7 +43,7 @@ const THINKING_SYSTEM_PROMPTS = {
     "1+1=2",
     "</answer>",
     "",
-    "现在开始。记住：不寒暄、不用表情、直接输出标签。",
+    "现在开始。记住：不寒暄、直接输出 <thinking> 标签。",
   ].join("\n"),
 
   deep: [
@@ -63,14 +61,13 @@ const THINKING_SYSTEM_PROMPTS = {
     "### 5. 验证与边界检查",
     "</thinking>",
     "<answer>",
-    "最终答案（纯文本，不使用任何 emoji 表情符号）",
+    "最终答案",
     "</answer>",
     "",
     "【绝对禁止】",
     "1. 标签之外不能有任何文字",
-    "2. 整个回复不能出现任何 emoji",
-    "3. 禁止寒暄——直接输出 <thinking> 开头的内容",
-    "4. 标签不能变形或省略",
+    "2. 禁止寒暄——直接输出 <thinking> 开头的内容",
+    "3. 标签不能变形或省略",
   ].join("\n"),
 };
 
@@ -110,7 +107,7 @@ function injectThinkingPrompt(body, depth = "standard", format = "anthropic") {
     const msgs = cloned.messages || [];
     if (msgs.length > 0) {
       const lastMsg = msgs[msgs.length - 1];
-      const hint = "\n\n（直接回复 <thinking>...</thinking><answer>...</answer>，不寒暄不用表情）";
+      const hint = "\n\n（直接回复 <thinking>...</thinking><answer>...</answer>，不要寒暄）";
       if (lastMsg.role === "user" && typeof lastMsg.content === "string") {
         lastMsg.content = lastMsg.content + hint;
       } else if (lastMsg.role === "user" && Array.isArray(lastMsg.content)) {
@@ -134,7 +131,7 @@ function injectThinkingPrompt(body, depth = "standard", format = "anthropic") {
       if (lastUserIdx >= 0) {
         messages[lastUserIdx].content =
           messages[lastUserIdx].content +
-          "\n\n（直接回复 <thinking>...</thinking><answer>...</answer>，不寒暄不用表情）";
+          "\n\n（直接回复 <thinking>...</thinking><answer>...</answer>，不要寒暄）";
       }
     }
     cloned.messages = messages;
