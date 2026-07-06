@@ -1,6 +1,6 @@
 /**
  * 代理转发核心模块
- * 处理 Anthropic / OpenAI 两种格式的请求转发
+ * 处理 Anthropic / OpenAI 两种格式的请求转发，支持流式与非流式
  */
 
 const config = require("./config");
@@ -18,7 +18,6 @@ function buildUpstreamHeaders(reqHeaders) {
     Authorization: `Bearer ${config.UPSTREAM_API_KEY}`,
   };
 
-  // 透传部分客户端头（但覆盖 Authorization）
   const passthrough = [
     "anthropic-version",
     "anthropic-beta",
@@ -27,8 +26,7 @@ function buildUpstreamHeaders(reqHeaders) {
   ];
   for (const key of passthrough) {
     const lk = key.toLowerCase();
-    const val =
-      reqHeaders[key] || reqHeaders[lk];
+    const val = reqHeaders[key] || reqHeaders[lk];
     if (val && key !== "x-api-key") {
       upstream[key] = val;
     }
@@ -38,31 +36,33 @@ function buildUpstreamHeaders(reqHeaders) {
 }
 
 /**
- * 处理 Anthropic 格式请求 (/v1/messages)
- * @param {object} body - 请求体
- * @param {object} headers - 客户端请求头
- * @returns {Promise<{status: number, body: object}>}
+ * 检测请求是否启用流式
  */
-async function proxyAnthropic(requestBody, reqHeaders) {
+function isStreamRequest(body) {
+  return body && body.stream === true;
+}
+
+/**
+ * 准备发给上游的请求体（注入 thinking 提示词等）
+ */
+function prepareUpstreamBody(requestBody, reqHeaders, format) {
   const body = JSON.parse(JSON.stringify(requestBody));
   const model = body.model || "claude-sonnet-4-6";
   const modelCfg = config.getModelConfig(model);
 
-  // 1. 提取 thinking effort / 深度标记
   const rawThinking = body.thinking;
   const effort = (rawThinking && rawThinking.effort) || null;
-  const { depth, body: cleanedBody } = extractDepthFromBody(body, "anthropic");
+  const { depth, body: cleanedBody } = extractDepthFromBody(body, format);
   const finalDepth = depth || config.DEFAULT_THINKING_DEPTH;
 
   console.log(
-    `[proxy] Anthropic | model=${model} | thinking=${modelCfg.thinking} | effort=${effort || "无"} | depth=${finalDepth}`
+    `[proxy] ${format === "anthropic" ? "Anthropic" : "OpenAI"} | model=${model} | thinking=${modelCfg.thinking} | effort=${effort || "无"} | depth=${finalDepth} | stream=${!!isStreamRequest(body)}`
   );
 
   let finalBody = cleanedBody;
 
   switch (modelCfg.thinking) {
     case config.THINKING_TYPES.NATIVE:
-      // 原生支持，透传 thinking 参数（包括 effort）
       if (effort) {
         console.log(`[proxy] 原生 thinking + effort=${effort}，透传`);
       } else {
@@ -70,24 +70,33 @@ async function proxyAnthropic(requestBody, reqHeaders) {
       }
       break;
 
-    case config.THINKING_TYPES.PROMPT:
-      // 不支持原生 thinking：
-      // - 如果传了 thinking.effort → 映射为提示词深度
-      // - 移除原始 thinking 参数后注入 system prompt
+    case config.THINKING_TYPES.PROMPT: {
       const mappedDepth = effort ? resolveDepth(effort) : finalDepth;
       console.log(`[proxy] 提示词模拟模式, thinking.effort=${effort || "无"} → depth=${mappedDepth}`);
       delete finalBody.thinking;
-      finalBody = injectThinkingPrompt(finalBody, mappedDepth, "anthropic");
+      finalBody = injectThinkingPrompt(finalBody, mappedDepth, format);
+
+      // 提示词模式不支持流式（需要完整回复才能解析 thinking 标签）
+      if (finalBody.stream) {
+        console.log(`[proxy] 提示词模式下强制关闭 stream（需要完整回复解析 thinking 块）`);
+        finalBody.stream = false;
+      }
       break;
+    }
 
     case config.THINKING_TYPES.NONE:
-      // 不涉及，直接透传
       delete finalBody.thinking;
       console.log(`[proxy] 无 thinking 模式，直接透传`);
       break;
   }
 
-  // 2. 转发到上游
+  return { body: finalBody, modelCfg };
+}
+
+/**
+ * 处理 Anthropic 格式的非流式请求
+ */
+async function proxyAnthropicNonStream(finalBody, modelCfg, reqHeaders) {
   const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/messages`;
   const upstreamHeaders = buildUpstreamHeaders(reqHeaders);
 
@@ -100,63 +109,81 @@ async function proxyAnthropic(requestBody, reqHeaders) {
   const responseBody = await response.json();
 
   if (!response.ok) {
-    return {
-      status: response.status,
-      body: responseBody,
-    };
+    return { status: response.status, body: responseBody };
   }
 
-  // 3. 可选：解析回复中的 thinking 标签，注入为独立 block
   if (config.PARSE_THINKING_RESPONSE && modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
-    return {
-      status: response.status,
-      body: enrichAnthropicResponse(responseBody),
-    };
+    return { status: response.status, body: enrichAnthropicResponse(responseBody) };
   }
 
-  return {
-    status: response.status,
-    body: responseBody,
-  };
+  return { status: response.status, body: responseBody };
 }
 
 /**
- * 处理 OpenAI 格式请求 (/v1/chat/completions)
- * @param {object} body - 请求体
- * @param {object} headers - 客户端请求头
- * @returns {Promise<{status: number, body: object}>}
+ * 处理 Anthropic 格式的流式请求 — 直接管道透传上游 SSE
+ * 仅用于 native / none 模式（prompt 模式已在 prepareUpstreamBody 中关闭 stream）
  */
-async function proxyOpenAI(requestBody, reqHeaders) {
-  const body = JSON.parse(JSON.stringify(requestBody));
-  const model = body.model || "claude-sonnet-4-6";
-  const modelCfg = config.getModelConfig(model);
+async function proxyAnthropicStream(finalBody, reqHeaders, res) {
+  const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/messages`;
+  const upstreamHeaders = buildUpstreamHeaders(reqHeaders);
 
-  // 提取用户消息中的思考深度标记
-  const { depth, body: cleanedBody } = extractDepthFromBody(body, "openai");
-  const finalDepth = depth || config.DEFAULT_THINKING_DEPTH;
+  const upstreamResp = await fetch(upstreamUrl, {
+    method: "POST",
+    headers: upstreamHeaders,
+    body: JSON.stringify(finalBody),
+  });
 
-  console.log(
-    `[proxy] OpenAI | model=${model} | thinking=${modelCfg.thinking} | depth=${finalDepth}`
-  );
-
-  let finalBody = cleanedBody;
-
-  switch (modelCfg.thinking) {
-    case config.THINKING_TYPES.PROMPT:
-      // 提示词模拟模式，注入 system prompt
-      finalBody = injectThinkingPrompt(finalBody, finalDepth, "openai");
-      console.log(`[proxy] 提示词模拟模式，已注入 thinking prompt`);
-      break;
-
-    case config.THINKING_TYPES.NATIVE:
-    case config.THINKING_TYPES.NONE:
-    default:
-      // 直接透传
-      console.log(`[proxy] 直接透传模式`);
-      break;
+  if (!upstreamResp.ok) {
+    const errText = await upstreamResp.text();
+    try {
+      return { status: upstreamResp.status, body: JSON.parse(errText) };
+    } catch {
+      return { status: upstreamResp.status, body: { error: errText } };
+    }
   }
 
-  // 转发到上游
+  // 设置 SSE 响应头
+  res.writeHead(upstreamResp.status, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  // 管道上游 SSE 流到客户端
+  const reader = upstreamResp.body.getReader();
+  const decoder = new TextDecoder();
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+  } catch (err) {
+    console.error("[proxy] 流传输中断:", err.message);
+  } finally {
+    reader.releaseLock();
+    res.end();
+  }
+}
+
+/**
+ * 处理 Anthropic 格式请求 (/v1/messages)
+ */
+async function proxyAnthropic(requestBody, reqHeaders, res) {
+  const { body: finalBody, modelCfg } = prepareUpstreamBody(requestBody, reqHeaders, "anthropic");
+
+  if (isStreamRequest(finalBody)) {
+    return proxyAnthropicStream(finalBody, reqHeaders, res);
+  }
+  return proxyAnthropicNonStream(finalBody, modelCfg, reqHeaders);
+}
+
+/**
+ * 处理 OpenAI 格式的非流式请求
+ */
+async function proxyOpenAINonStream(finalBody, modelCfg, reqHeaders) {
   const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/chat/completions`;
   const upstreamHeaders = buildUpstreamHeaders(reqHeaders);
 
@@ -169,30 +196,73 @@ async function proxyOpenAI(requestBody, reqHeaders) {
   const responseBody = await response.json();
 
   if (!response.ok) {
-    return {
-      status: response.status,
-      body: responseBody,
-    };
+    return { status: response.status, body: responseBody };
   }
 
-  // 可选解析 thinking 标签
-  if (
-    config.PARSE_THINKING_RESPONSE &&
-    modelCfg.thinking === config.THINKING_TYPES.PROMPT
-  ) {
+  if (config.PARSE_THINKING_RESPONSE && modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
     const enriched = enrichOpenAIResponse(responseBody);
     return { status: response.status, body: enriched };
   }
 
-  return {
-    status: response.status,
-    body: responseBody,
-  };
+  return { status: response.status, body: responseBody };
 }
 
 /**
- * 增强 OpenAI 格式响应：解析 thinking/answer 标签
+ * 处理 OpenAI 格式的流式请求 — 直接管道透传上游 SSE
  */
+async function proxyOpenAIStream(finalBody, reqHeaders, res) {
+  const upstreamUrl = `${config.UPSTREAM_BASE_URL}/v1/chat/completions`;
+  const upstreamHeaders = buildUpstreamHeaders(reqHeaders);
+
+  const upstreamResp = await fetch(upstreamUrl, {
+    method: "POST",
+    headers: upstreamHeaders,
+    body: JSON.stringify(finalBody),
+  });
+
+  if (!upstreamResp.ok) {
+    const errText = await upstreamResp.text();
+    try {
+      return { status: upstreamResp.status, body: JSON.parse(errText) };
+    } catch {
+      return { status: upstreamResp.status, body: { error: errText } };
+    }
+  }
+
+  res.writeHead(upstreamResp.status, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  const reader = upstreamResp.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+  } catch (err) {
+    console.error("[proxy] 流传输中断:", err.message);
+  } finally {
+    reader.releaseLock();
+    res.end();
+  }
+}
+
+/**
+ * 处理 OpenAI 格式请求 (/v1/chat/completions)
+ */
+async function proxyOpenAI(requestBody, reqHeaders, res) {
+  const { body: finalBody, modelCfg } = prepareUpstreamBody(requestBody, reqHeaders, "openai");
+
+  if (isStreamRequest(finalBody)) {
+    return proxyOpenAIStream(finalBody, reqHeaders, res);
+  }
+  return proxyOpenAINonStream(finalBody, modelCfg, reqHeaders);
+}
+
 function enrichOpenAIResponse(responseBody) {
   if (!responseBody || !responseBody.choices) return responseBody;
 
@@ -206,7 +276,6 @@ function enrichOpenAIResponse(responseBody) {
       message: {
         ...choice.message,
         content: parsed.answer,
-        // 将 thinking 附加到 message 上（OpenAI 没有原生 thinking block）
         thinking_content: parsed.thinking || undefined,
       },
     };
