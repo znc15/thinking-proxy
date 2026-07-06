@@ -16,14 +16,36 @@ function extractTag(text, tag) {
 }
 
 /**
+ * 从原始文本中剥离所有 XML 标签，只保留纯文本
+ * 兜底处理：当 parseResponse 无法提取标签时使用
+ */
+function stripTags(text) {
+  return text
+    .replace(/<\/?thinking>/gi, "")
+    .replace(/<\/?answer>/gi, "")
+    .trim();
+}
+
+/**
  * 解析回复，提取 thinking 和 answer
- * @param {string} text - 原始回复文本
- * @returns {{thinking: string|null, answer: string, raw: string}}
+ * 如果找不到标签，返回剥离标签后的纯文本作为 answer
  */
 function parseResponse(text) {
+  const thinking = extractTag(text, "thinking");
+  const answer = extractTag(text, "answer");
+
+  if (thinking || answer) {
+    return {
+      thinking,
+      answer: answer || stripTags(text),
+      raw: text,
+    };
+  }
+
+  // 两个标签都找不到 → 兜底剥离
   return {
-    thinking: extractTag(text, "thinking"),
-    answer: extractTag(text, "answer") || text,
+    thinking: null,
+    answer: stripTags(text),
     raw: text,
   };
 }
@@ -88,5 +110,5 @@ module.exports = {
   parseResponse,
   hideThinking,
   thinkingOnly,
-  enrichAnthropicResponse,
+  stripTags,
 };
