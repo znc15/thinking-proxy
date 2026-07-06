@@ -27,27 +27,51 @@ function stripTags(text) {
 }
 
 /**
- * 解析回复，提取 thinking 和 answer
- * 如果找不到标签，返回剥离标签后的纯文本作为 answer
+ * 自动修复残缺标签：补上缺失的开头/结尾标签
+ * 常见情况：模型漏写 <thinking> 开头，直接输出内容然后跟 </thinking>
  */
-function parseResponse(text) {
-  const thinking = extractTag(text, "thinking");
-  const answer = extractTag(text, "answer");
+function autoFixTags(text) {
+  let fixed = text;
 
-  if (thinking || answer) {
-    return {
-      thinking,
-      answer: answer || stripTags(text),
-      raw: text,
-    };
+  // 情况1: 漏了 <thinking> 开头，但以纯文本开头且后面有 </thinking>
+  //   "推理内容...</thinking><answer>答案</answer>"
+  if (!/^\s*</.test(fixed) && /<\/thinking>/i.test(fixed)) {
+    fixed = "<thinking>" + fixed;
   }
 
-  // 两个标签都找不到 → 兜底剥离
-  return {
-    thinking: null,
-    answer: stripTags(text),
-    raw: text,
-  };
+  // 情况2: 有 <thinking> 开头但漏了 </thinking>，后面直接跟 <answer>
+  //   "<thinking>推理...<answer>答案</answer>"
+  if (/<thinking>/i.test(fixed) && /<answer>/i.test(fixed) && !/<\/thinking>/i.test(fixed)) {
+    fixed = fixed.replace(/<thinking>/i, "<thinking>").replace(/(<thinking>[\s\S]*?)(<answer>)/i, "$1</thinking>$2");
+  }
+
+  // 情况3: 有 </thinking> 但没有 <thinking>，补上开头
+  if (/<\/thinking>/i.test(fixed) && !/<thinking>/i.test(fixed)) {
+    fixed = "<thinking>" + fixed;
+  }
+
+  // 情况4: 整个回复以 <answer> 开头（连 thinking 块都没有）
+  if (/^\s*<answer>/i.test(fixed) && !/<thinking>/i.test(fixed)) {
+    fixed = "<thinking>（用户请求处理）</thinking>" + fixed;
+  }
+
+  return fixed;
+}
+
+/**
+ * 解析回复，提取 thinking 和 answer
+ * 找不到标签时自动修复 + 兜底剥离
+ */
+function parseResponse(text) {
+  const fixed = autoFixTags(text);
+  const thinking = extractTag(fixed, "thinking");
+  const answer = extractTag(fixed, "answer");
+
+  if (thinking || answer) {
+    return { thinking, answer: answer || stripTags(fixed), raw: text };
+  }
+
+  return { thinking: null, answer: stripTags(fixed), raw: text };
 }
 
 /**
@@ -110,5 +134,5 @@ module.exports = {
   parseResponse,
   hideThinking,
   thinkingOnly,
-  stripTags,
+  autoFixTags,
 };
