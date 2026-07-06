@@ -1,0 +1,16 @@
+services:
+  thinking-proxy:
+    build: .
+    container_name: thinking-proxy
+    restart: unless-stopped
+    ports:
+      - "${PORT:-19901}:19901"
+    environment:
+      - PORT=19901
+      - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY}
+      - DEFAULT_THINKING_DEPTH=${DEFAULT_THINKING_DEPTH:-standard}
+      - PARSE_THINKING_RESPONSE=${PARSE_THINKING_RESPONSE:-true}
+    # 如果修改了 config.json，映射出来方便热更
+    volumes:
+      - ./config.json:/app/config.json:ro

@@ -1,0 +1,14 @@
+{
+  "name": "thinking-proxy",
+  "version": "1.0.0",
+  "description": "Claude 模型代理服务器 — 支持原生 thinking 透传 / 提示词模拟思考 / 模型能力配置",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "dotenv": "^16.4.0"
+  }
+}

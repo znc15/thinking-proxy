@@ -1,0 +1,79 @@
+{
+  "models": {
+    "claude-sonnet-4-6": {
+      "thinking": "prompt",
+      "label": "Claude Sonnet 4.6"
+    },
+    "claude-opus-4-8": {
+      "thinking": "prompt",
+      "label": "Claude Opus 4.8"
+    },
+    "claude-opus-4-7": {
+      "thinking": "prompt",
+      "label": "Claude Opus 4.7"
+    },
+    "claude-haiku-4-5": {
+      "thinking": "prompt",
+      "label": "Claude Haiku 4.5"
+    },
+    "claude-haiku-4-5-20251001": {
+      "thinking": "prompt",
+      "label": "Claude Haiku 4.5 (固定版本)"
+    },
+    "claude-fable-5": {
+      "thinking": "prompt",
+      "label": "Claude Fable 5"
+    },
+    "gpt-4o": {
+      "thinking": "none",
+      "label": "GPT-4o"
+    },
+    "gpt-5.5": {
+      "thinking": "none",
+      "label": "GPT-5.5"
+    },
+    "gpt-5.4": {
+      "thinking": "none",
+      "label": "GPT-5.4"
+    },
+    "gpt-5.4-mini": {
+      "thinking": "none",
+      "label": "GPT-5.4 Mini"
+    },
+    "gpt-5-mini": {
+      "thinking": "none",
+      "label": "GPT-5 Mini"
+    },
+    "gpt-4-turbo": {
+      "thinking": "none",
+      "label": "GPT-4 Turbo"
+    },
+    "gpt-image-2": {
+      "thinking": "none",
+      "label": "GPT Image 2"
+    },
+    "deepseek-v4-flash": {
+      "thinking": "none",
+      "label": "DeepSeek V4 Flash"
+    },
+    "qwen3.5-122b-a10b": {
+      "thinking": "none",
+      "label": "Qwen 3.5 122B"
+    },
+    "qwen3.5-397b-a17b": {
+      "thinking": "none",
+      "label": "Qwen 3.5 397B"
+    },
+    "step-3.5-flash": {
+      "thinking": "none",
+      "label": "Step 3.5 Flash"
+    }
+  },
+
+  "effort_mapping": {
+    "low": { "depth": "quick", "description": "快速思考，1-3句简要推理" },
+    "medium": { "depth": "standard", "description": "标准思考，完整五步推理" },
+    "high": { "depth": "deep", "description": "深度思考，多方案对比 + 详细推导" },
+    "max": { "depth": "deep", "description": "极限深度，额外反事实分析 + 置信度评估" }
+  }
+}
