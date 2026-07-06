@@ -75,9 +75,9 @@ function prepareUpstreamBody(requestBody, format) {
   return { body: finalBody, model, modelCfg };
 }
 
-// ── 统一管道：流式透传 SSE ─────────────────────────────
+// ── 流式透传（prompt 模式需要解析标签后重新流式输出）──
 
-async function proxyStream(upstreamUrl, finalBody, reqHeaders, res) {
+async function proxyStreamRaw(upstreamUrl, finalBody, reqHeaders, res) {
   const upstreamResp = await fetch(upstreamUrl, {
     method: "POST",
     headers: buildUpstreamHeaders(reqHeaders),
@@ -106,6 +106,68 @@ async function proxyStream(upstreamUrl, finalBody, reqHeaders, res) {
   }
 }
 
+/**
+ * prompt 模式流式：收集完整回复 → 解析 thinking/answer → 用 Anthropic SSE 格式输出
+ */
+async function proxyStreamParsed(upstreamUrl, finalBody, reqHeaders, res) {
+  const upstreamResp = await fetch(upstreamUrl, {
+    method: "POST",
+    headers: buildUpstreamHeaders(reqHeaders),
+    body: JSON.stringify(finalBody),
+  });
+
+  if (!upstreamResp.ok) {
+    const errText = await upstreamResp.text();
+    const errBody = (() => { try { return JSON.parse(errText); } catch { return { error: errText }; } })();
+    res.status(upstreamResp.status).json(errBody);
+    return;
+  }
+
+  // 收集完整文本
+  const fullText = await upstreamResp.text();
+  const parsed = parseResponse(fullText);
+
+  // 以 Anthropic SSE 格式重新流式输出
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  const lines = [];
+  if (parsed.thinking) {
+    lines.push(
+      "event: content_block_start",
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+      "",
+      "event: content_block_delta",
+      `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: parsed.thinking } })}`,
+      "",
+      "event: content_block_stop",
+      'data: {"type":"content_block_stop","index":0}',
+      ""
+    );
+  }
+  lines.push(
+    "event: content_block_start",
+    `data: {"type":"content_block_start","index":${parsed.thinking ? 1 : 0},"content_block":{"type":"text","text":""}}`,
+    "",
+    "event: content_block_delta",
+    `data: ${JSON.stringify({ type: "content_block_delta", index: parsed.thinking ? 1 : 0, delta: { type: "text_delta", text: parsed.answer } })}`,
+    "",
+    "event: content_block_stop",
+    `data: {"type":"content_block_stop","index":${parsed.thinking ? 1 : 0}}`,
+    "",
+    "event: message_stop",
+    'data: {"type":"message_stop"}',
+    ""
+  );
+
+  res.write(lines.join("\n"));
+  res.end();
+}
+
 // ── 非流式 ─────────────────────────────────────────────
 
 async function proxyNonStream(upstreamUrl, finalBody, modelCfg, reqHeaders) {
@@ -131,8 +193,14 @@ async function proxyAnthropic(requestBody, reqHeaders, res) {
   const url = `${config.UPSTREAM_BASE_URL}/v1/messages`;
 
   if (isStreamRequest(finalBody)) {
-    await proxyStream(url, finalBody, reqHeaders, res);
-    return null; // res 已被接管
+    if (modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
+      // prompt 模式流式：先收集完整文本，解析后再以 SSE 格式输出
+      await proxyStreamParsed(url, finalBody, reqHeaders, res);
+    } else {
+      // native/none 模式流式：管道直传
+      await proxyStreamRaw(url, finalBody, reqHeaders, res);
+    }
+    return null;
   }
   return proxyNonStream(url, finalBody, modelCfg, reqHeaders);
 }
@@ -142,12 +210,15 @@ async function proxyOpenAI(requestBody, reqHeaders, res) {
   const url = `${config.UPSTREAM_BASE_URL}/v1/chat/completions`;
 
   if (isStreamRequest(finalBody)) {
-    await proxyStream(url, finalBody, reqHeaders, res);
+    if (modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
+      await proxyStreamParsed(url, finalBody, reqHeaders, res);
+    } else {
+      await proxyStreamRaw(url, finalBody, reqHeaders, res);
+    }
     return null;
   }
 
   const responseBody = await proxyNonStream(url, finalBody, modelCfg, reqHeaders);
-  // prompt 模式非流式：OpenAI 格式额外解析
   if (config.PARSE_THINKING_RESPONSE && modelCfg.thinking === config.THINKING_TYPES.PROMPT) {
     return enrichOpenAIResponse(responseBody);
   }
